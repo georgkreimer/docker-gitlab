@@ -22,11 +22,6 @@ DB_POOL=${DB_POOL:-5}
 
 # start mysql server if ${DB_HOST} is localhost
 if [ "${DB_HOST}" == "localhost" ]; then
-	if [ ! -d /var/lib/mysql/mysql ]; then
-		DB_INIT="yes"
-		mysql_install_db --user=mysql
-	fi
-
 	cat > /etc/supervisor/conf.d/mysqld.conf <<EOF
 [program:mysqld]
 priority=20
@@ -40,10 +35,23 @@ stderr_logfile=/var/log/supervisor/%(program_name)s.log
 EOF
 
 	supervisorctl update
-	sleep 10
-	if [ "${DB_INIT}" == "yes" ]; then
-		echo 'CREATE DATABASE IF NOT EXISTS `gitlabhq_production` DEFAULT CHARACTER SET `utf8` COLLATE `utf8_unicode_ci`;' | mysql -uroot
-		echo 'GRANT SELECT, LOCK TABLES, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER ON `gitlabhq_production`.* TO 'root'@'localhost';' | mysql -uroot
+
+	# wait for mysql server to start (max 120 seconds)
+	timeout=120
+	while ! mysqladmin -uroot ${DB_PASS:+-p$DB_PASS} status >/dev/null 2>&1
+	do
+		timeout=$(expr $timeout - 1)
+		if [ $timeout -eq 0 ]; then
+			echo "Failed to start mysql server"
+			exit 1
+		fi
+		sleep 1
+	done
+
+	if ! echo "USE ${DB_NAME}" | mysql -uroot ${DB_PASS:+-p$DB_PASS} >/dev/null 2>&1; then
+		DB_INIT="yes"
+		echo "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` DEFAULT CHARACTER SET \`utf8\` COLLATE \`utf8_unicode_ci\`;" | mysql -uroot ${DB_PASS:+-p$DB_PASS}
+		echo "GRANT SELECT, LOCK TABLES, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER ON \`${DB_NAME}\`.* TO 'root'@'localhost';" | mysql -uroot ${DB_PASS:+-p$DB_PASS}
 	fi
 fi
 
