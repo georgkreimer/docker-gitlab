@@ -1,0 +1,295 @@
+#!/bin/bash
+
+GITLAB_HOST=${GITLAB_HOST:-localhost}
+GITLAB_EMAIL=${GITLAB_EMAIL:-gitlab@localhost}
+GITLAB_SUPPORT=${GITLAB_SUPPORT:-support@localhost}
+GITLAB_SIGNUP=${GITLAB_SIGNUP:-false}
+
+REDIS_HOST=${REDIS_HOST:-localhost}
+REDIS_PORT=${REDIS_PORT:-6379}
+
+UNICORN_WORKERS=${UNICORN_WORKERS:-2}
+UNICORN_TIMEOUT=${UNICORN_TIMEOUT:-60}
+SIDEKIQ_CONCURRENCY=${SIDEKIQ_CONCURRENCY:-5}
+
+DB_HOST=${DB_HOST:-localhost}
+DB_NAME=${DB_NAME:-gitlabhq_production}
+DB_USER=${DB_USER:-root}
+DB_PASS=${DB_PASS:-}
+DB_INIT=${DB_INIT:-}
+DB_POOL=${DB_POOL:-5}
+
+SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+SMTP_PORT=${SMTP_PORT:-587}
+SMTP_USER=${SMTP_USER:-}
+SMTP_PASS=${SMTP_PASS:-}
+
+# start supervisord
+/usr/bin/supervisord
+
+# start mysql server if ${DB_HOST} is localhost
+if [ "${DB_HOST}" == "localhost" ]; then
+	cat > /etc/supervisor/conf.d/mysqld.conf <<EOF
+[program:mysqld]
+priority=20
+directory=/tmp
+command=/usr/bin/mysqld_safe
+user=root
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/supervisor/%(program_name)s.log
+stderr_logfile=/var/log/supervisor/%(program_name)s.log
+EOF
+
+	# initialize MySQL data directory
+	if [ ! -d /var/lib/mysql/mysql ]; then
+		mysql_install_db --user=mysql
+	fi
+
+	# make sure /var/lib/mysql/ has the right permissions in case it is mounted as a volume.
+	chown -R mysql:mysql /var/lib/mysql
+	chmod 700 /var/lib/mysql
+
+	supervisorctl update
+
+	# wait for mysql server to start (max 120 seconds)
+	timeout=120
+	while ! mysqladmin -uroot ${DB_PASS:+-p$DB_PASS} status >/dev/null 2>&1
+	do
+		timeout=$(expr $timeout - 1)
+		if [ $timeout -eq 0 ]; then
+			echo "Failed to start mysql server"
+			exit 1
+		fi
+		sleep 1
+	done
+
+	if ! echo "USE ${DB_NAME}" | mysql -uroot ${DB_PASS:+-p$DB_PASS} >/dev/null 2>&1; then
+		DB_INIT="yes"
+		echo "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` DEFAULT CHARACTER SET \`utf8\` COLLATE \`utf8_unicode_ci\`;" | mysql -uroot ${DB_PASS:+-p$DB_PASS}
+		echo "GRANT SELECT, LOCK TABLES, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER ON \`${DB_NAME}\`.* TO 'root'@'localhost';" | mysql -uroot ${DB_PASS:+-p$DB_PASS}
+	fi
+fi
+
+if [ "${REDIS_HOST}" == "localhost" ]; then
+	sed 's/daemonize yes/daemonize no/' -i /etc/redis/redis.conf
+	cat > /etc/supervisor/conf.d/redis-server.conf <<EOF
+[program:redis-server]
+priority=20
+directory=/tmp
+command=/usr/bin/redis-server /etc/redis/redis.conf
+user=redis
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/supervisor/%(program_name)s.log
+stderr_logfile=/var/log/supervisor/%(program_name)s.log
+EOF
+	supervisorctl update
+fi
+
+# configure postfix for mail delivery
+if [ -n "${SMTP_HOST}" -a -n "${SMTP_USER}" -a -n "${SMTP_PASS}" ]; then
+	cat >> /etc/postfix/main.cf <<EOF
+
+relayhost = [${SMTP_HOST}]:${SMTP_PORT}
+smtp_sasl_auth_enable = yes
+smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
+smtp_sasl_security_options = noanonymous
+smtp_tls_CAfile = /etc/postfix/cacert.pem
+smtp_use_tls = yes
+EOF
+
+	cat > /etc/postfix/sasl_passwd <<EOF
+[${SMTP_HOST}]:${SMTP_PORT}    ${SMTP_USER}:${SMTP_PASS}
+EOF
+
+	touch /etc/mailname
+	chmod 400 /etc/postfix/sasl_passwd
+	postmap /etc/postfix/sasl_passwd
+
+	cat /etc/ssl/certs/Thawte_Premium_Server_CA.pem | sudo tee -a /etc/postfix/cacert.pem
+
+	# start ppostmap /etc/postfix/sasl_passwdotouch /etc/mailnamestfix mail server
+	/etc/init.d/postfix start
+fi
+
+# configure git for the 'git' user
+sudo -u git -H git config --global user.name "GitLab"
+sudo -u git -H git config --global user.email "${GITLAB_EMAIL}"
+sudo -u git -H git config --global core.autocrlf input
+
+# configure server url
+sudo -u git -H sed 's/host: localhost/host: '${GITLAB_HOST}'/' -i /home/git/gitlab/config/gitlab.yml
+sudo -u git -H sed 's/email_from: gitlab@localhost/email_from: '${GITLAB_EMAIL}'/' -i /home/git/gitlab/config/gitlab.yml
+sudo -u git -H sed 's/support_email: support@localhost/support_email: '${GITLAB_SUPPORT}'/' -i /home/git/gitlab/config/gitlab.yml
+
+# configure gitlab signup configuration
+sudo -u git -H sed 's/# signup_enabled: true/signup_enabled: '${GITLAB_SIGNUP}'/' -i /home/git/gitlab/config/gitlab.yml
+
+# configure database
+sudo -u git -H sed 's/{{DB_HOST}}/'${DB_HOST}'/' -i /home/git/gitlab/config/database.yml
+sudo -u git -H sed 's/{{DB_NAME}}/'${DB_NAME}'/' -i /home/git/gitlab/config/database.yml
+sudo -u git -H sed 's/{{DB_USER}}/'${DB_USER}'/' -i /home/git/gitlab/config/database.yml
+sudo -u git -H sed 's/{{DB_PASS}}/'${DB_PASS}'/' -i /home/git/gitlab/config/database.yml
+sudo -u git -H sed 's/{{DB_POOL}}/'${DB_POOL}'/' -i /home/git/gitlab/config/database.yml
+
+# configure sidekiq
+sudo -u git -H sed 's/{{SIDEKIQ_CONCURRENCY}}/'${SIDEKIQ_CONCURRENCY}'/' -i /home/git/gitlab/config/sidekiq.yml
+
+# configure redis
+sudo -u git -H sed 's/redis.example.com:6379/'${REDIS_HOST}':'${REDIS_PORT}'/' -i /home/git/gitlab/config/resque.yml
+
+# configure gitlab-shell
+sudo -u git -H sed 's/host: 127.0.0.1/host: '${REDIS_HOST}'/' -i /home/git/gitlab-shell/config.yml
+sudo -u git -H sed 's/port: 6379/port: '${REDIS_PORT}'/' -i /home/git/gitlab-shell/config.yml
+
+# configure unicorn workers
+sed 's/worker_processes 2/worker_processes '${UNICORN_WORKERS}'/' -i /home/git/gitlab/config/unicorn.rb
+
+# configure unicorn timeout
+sed 's/timeout 30/timeout '${UNICORN_TIMEOUT}'/' -i /home/git/gitlab/config/unicorn.rb
+
+# take ownership of /home/git/data
+chown git:git /home/git/data
+
+# create the repositories directory and make sure it has the right permissions
+sudo -u git -H mkdir -p /home/git/data/repositories/
+sudo chmod ug+rwX,o-rwx /home/git/data/repositories/
+sudo chmod ug-s /home/git/data/repositories/
+find /home/git/data/repositories/ -type d -print0 | sudo xargs -0 chmod g+s
+chown git:git /home/git/data/repositories
+
+# create the satellites directory and make sure it has the right permissions
+sudo -u git -H mkdir -p /home/git/data/gitlab-satellites/
+sudo chmod ug+rwX,o-rwx /home/git/data/gitlab-satellites/
+sudo chmod ug-s /home/git/data/gitlab-satellites/
+find /home/git/data/gitlab-satellites/ -type d -print0 | sudo xargs -0 chmod g+s
+chown git:git /home/git/data/gitlab-satellites
+
+# create the backups directory
+sudo -u git -H mkdir -p /home/git/data/backups/
+chown git:git /home/git/data/backups/
+
+# create the uploads directory
+sudo -u git -H mkdir -p /home/git/data/uploads/
+chmod -R u+rwX /home/git/data/uploads/
+chown git:git /home/git/data/uploads/
+
+# create the .ssh directory
+sudo -u git -H mkdir -p /home/git/data/.ssh/
+touch /home/git/data/.ssh/authorized_keys
+chmod 700 /home/git/data/.ssh
+chmod 600 /home/git/data/.ssh/authorized_keys
+chown -R git:git /home/git/data/.ssh
+
+cd /home/git/gitlab/
+
+db_initialize () {
+	echo "Initializing database..."
+	sudo -u git -H force=yes bundle exec rake gitlab:setup RAILS_ENV=production
+}
+
+db_migrate () {
+	echo "Migrating database..."
+	sudo -u git -H bundle exec rake db:migrate RAILS_ENV=production
+}
+
+gitlab_start () {
+	echo "Starting gitlab server..."
+	# reset the database if the --db-init switch was given.
+	if [ "$DB_INIT" == "yes" ]; then
+		db_initialize
+	fi
+
+	sudo -u git -H bundle exec rake assets:clean RAILS_ENV=production
+	sudo -u git -H bundle exec rake assets:precompile RAILS_ENV=production
+	sudo -u git -H bundle exec rake cache:clear RAILS_ENV=production
+
+	# start the gitlab application
+	# sudo -u git -H bundle exec rake gitlab:env:info RAILS_ENV=production
+	/etc/init.d/gitlab start
+
+	# create satellite directories
+	sudo -u git -H bundle exec rake gitlab:satellites:create RAILS_ENV=production
+	sudo -u git -H bundle exec rake gitlab:check RAILS_ENV=production
+
+	# kickstart the rails application
+	wget "http://localhost" -O /dev/null
+
+	# watch the access logs
+	tail -F /var/log/nginx/gitlab_access.log
+}
+
+gitlab_backup () {
+	echo "Backing up gitlab..."
+	sudo -u git -H bundle exec rake gitlab:backup:create RAILS_ENV=production
+}
+
+gitlab_restore () {
+	nBackups=$(ls tmp/backups/*_gitlab_backup.tar | wc -l)
+	if [ $nBackups -eq 0 ]; then
+		echo "No backup present. Cannot continue restore process.".
+		return 1
+	fi
+
+	for b in `ls tmp/backups/ | sort -r`
+	do
+		echo " ├ $b"
+	done
+	read -p "Select a backup to restore: " file
+
+	if [ ! -f "tmp/backups/${file}" ]; then
+		echo "Specified backup does not exist. Aboring..."
+		return 1
+	fi
+
+	timestamp=$(echo $file | cut -d'_' -f1)
+	sudo -u git -H bundle exec rake gitlab:backup:restore RAILS_ENV=production BACKUP=$timestamp
+}
+
+gitlab_help () {
+	echo "Available options:"
+	echo " app:start          - Starts the gitlab server (default)"
+	echo " app:backup         - Backup the gitlab data"
+	echo " app:restore        - Restore a backup"
+	echo " app:db:initialize  - Initialize the database."
+	echo " app:db:migrate     - Migrate the database."
+	echo " app:help           - Displays the help"
+	echo " [command]          - Execute the specified linux command eg. bash."
+}
+
+case "$1" in
+	app:start)
+		gitlab_start
+		;;
+	app:backup)
+		gitlab_backup
+		;;
+	app:restore)
+		gitlab_restore
+		;;
+	app:db:initialize)
+		db_initialize
+		;;
+	app:db:migrate)
+		db_migrate
+		;;
+	app:help)
+		gitlab_help
+		;;
+	*)
+		if [ -x $1 ]; then
+			$1
+		else
+			prog=$(which $1)
+			if [ -n "${prog}" ] ; then
+				shift 1
+				$prog $@
+			else
+				gitlab_help
+			fi
+		fi
+		;;
+esac
+
+exit 0
